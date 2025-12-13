@@ -34,17 +34,10 @@ output/
 metrics/
 *.csv
 
-# ---- Local datasets (DO NOT COMMIT) ----
-dataset/
-enrollments/
-captures/
-faces/
-data/
-*.npz
 
-# ---- Model files (optional) ----
-# If you want to keep model files out of git, ignore them.
-# If you prefer to include YuNet in the repo, remove the yunet line below.
+
+# ---- Model files  ----
+
 models/**/*.onnx
 models/**/*.pt
 models/**/settings.json
