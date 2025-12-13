@@ -1,181 +1,115 @@
-README.md
-# AVIS — AI Vision Identity System (Local, Real-Time)
+# AVIS (AI Vision Identity System)
 
-AVIS is a **local-only, real-time** computer vision pipeline for **person detection → face detection → tracking → (optional) opt-in identity recognition → anonymization**.
+AVIS is a local, real-time computer vision project I built in Python. It detects people, finds faces inside the upper head region, tracks faces over time, and can optionally do opt-in recognition and anonymization. The goal of this project is to show strong system design, real-time behavior, and clean CLI tooling (not just a demo script).
 
-This is built as a **portfolio-grade system** (not a toy): configurable CLI, real-time behavior controls, tracking state, privacy toggles, and evaluation logging.
+## Features
 
-## What it does
+- Real-time YOLOv8 person detection (Ultralytics)
+- Head ROI cropping to focus face detection on the top portion of the person box
+- Face detection using YuNet (OpenCV FaceDetectorYN)
+- Tracking with Kalman filtering
+  - Track persistence across short detection dropouts
+  - Track state shows MEAS (measured) vs PRED (predicted)
+- Optional identity recognition (opt-in only)
+  - ArcFace embeddings (ONNX using OpenCV DNN)
+  - Cosine similarity matching against enrolled templates
+- Privacy mode
+  - Pixelate all faces or only unknown faces
+- Optional face crop collection (opt-in only)
+- Optional metrics logging to CSV for evaluation
 
-- **Real-time YOLOv8 person detection** (Ultralytics)
-- **Head ROI cropping** to reduce false positives and speed up face detection
-- **Face detection using YuNet (OpenCV FaceDetectorYN)** (more reliable than Haar)
-- **Tracking with Kalman (default)**  
-  - Track persistence across missed detections (occlusion tolerance)
-  - Clear tracking state: **MEAS** (measured) vs **PRED** (predicted)
-- **Optional embeddings + opt-in recognition**
-  - ArcFace embeddings (ONNX via OpenCV DNN)
-  - Cosine similarity matching vs enrolled templates
-- **Privacy controls**
-  - `--anonymize all` or `--anonymize unknown` (pixelation)
-- **Dataset collection (opt-in only)**
-  - Save face crops only on strong measurements
-- **Evaluation harness**
-  - Per-frame metrics logging to CSV
+## Ethics
 
-## Ethics / Safety
-
-AVIS is designed for **ethical-only, opt-in** use:
-- No scraping real people.
-- No covert surveillance features.
-- Enrollment and face datasets are **explicitly user-provided**.
-- Anonymization modes are included to support privacy-first workflows.
+This project is designed for ethical, opt-in use only.
+- No scraping real people
+- No covert surveillance tools
+- Datasets are user-provided with explicit consent
+- Anonymization exists to support privacy-first usage
 
 ## Requirements
 
-- macOS + Python **3.12.x**
-- `ultralytics`, `opencv-python`, `numpy`
-- YuNet ONNX face detector model file
+- macOS or Windows 11+
+- Python 3.12.x
+- OpenCV, NumPy, Ultralytics
 
-Optional:
-- ArcFace ONNX model (for embeddings / ReID-style matching)
-
-## Install
-
+Install:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install --upgrade pip
 python3 -m pip install ultralytics opencv-python numpy
-
-
-Note: If you use MediaPipe later, it requires numpy<2. Keep AVIS in its own venv.
-
 Models
-YuNet (Face Detector)
-
-Place the YuNet ONNX here (default path used by the script):
+YuNet face detector ONNX (default path used by the script):
 
 models/yunet/face_detection_yunet_2023mar.onnx
 
+ArcFace embeddings ONNX (optional, you provide the file path):
 
-Run with:
+Use --arcface-model /full/path/to/arcface.onnx
 
+Quick usage
+Webcam:
+
+bash
+Copy code
 python3 realtime_yolo.py --camera 0 --no-collect
+Video file:
 
-ArcFace (Optional Embeddings)
-
-If using embeddings, provide an ArcFace ONNX file and point to it:
-
-python3 realtime_yolo.py --camera 0 --no-collect --embeddings \
-  --arcface-model /full/path/to/arcface.onnx \
-  --enroll-dir enrollments
-
-Quickstart Commands
-Webcam (default tracking)
-python3 realtime_yolo.py --camera 0 --no-collect
-
-Video file
+bash
+Copy code
 python3 realtime_yolo.py --video testvideo.mp4 --no-collect
+Lower CPU usage (runs face detector less often):
 
-Improve stability / speed tradeoffs
-
-Run face detector less often (saves CPU, more prediction frames):
-
+bash
+Copy code
 python3 realtime_yolo.py --camera 0 --no-collect --detect-every 2
+Anonymize everyone:
 
-
-Lower resize width (saves CPU):
-
-python3 realtime_yolo.py --camera 0 --no-collect --target-width 800
-
-Enable anonymization
-
-Pixelate everyone:
-
+bash
+Copy code
 python3 realtime_yolo.py --camera 0 --no-collect --anonymize all
+Anonymize unknown faces only (best demo if embeddings are enabled):
 
+bash
+Copy code
+python3 realtime_yolo.py --camera 0 --no-collect --anonymize unknown --embeddings \
+  --arcface-model /full/path/to/arcface.onnx --enroll-dir enrollments
+Opt-in face collection:
 
-Pixelate unknown only (best privacy-first demo):
-
-python3 realtime_yolo.py --camera 0 --no-collect --anonymize unknown \
-  --embeddings --arcface-model /full/path/to/arcface.onnx --enroll-dir enrollments
-
-Opt-in face collection
-
-Saves crops only on strong measurements (MEAS) at your chosen cadence:
-
+bash
+Copy code
 python3 realtime_yolo.py --camera 0 --collect-label keanu --save-every 2
+Write metrics CSV:
 
-Metrics CSV (evaluation)
-
-Writes per-frame stats (fps, tracks, MEAS/PRED counts, etc.):
-
+bash
+Copy code
 python3 realtime_yolo.py --camera 0 --no-collect --eval-csv runs/metrics.csv
-
-CLI Reference (most useful flags)
-
-Input:
-
---camera 0 : webcam
-
---video path.mp4 : video file
-
-Performance:
+Helpful flags
+--camera 0 or --video path.mp4
 
 --target-width 960
 
---detect-every 1 : face detector cadence
+--conf 0.25
 
-Tracking:
+--detect-every 1
 
 --max-age 18
 
 --iou-thresh 0.20
 
-Collection:
-
---collect-label name
-
---no-collect
-
---save-every 2
-
-Embeddings / Identity (opt-in):
-
---embeddings
-
---arcface-model /path/to/arcface.onnx
-
---enroll-dir enrollments
-
---id-thresh 0.45
-
-Privacy:
-
 --anonymize none|all|unknown
 
---pixel-blocks 14
+--embeddings --arcface-model ... --enroll-dir ... --id-thresh 0.45
 
-Logging:
+--eval-csv runs/metrics.csv
 
---log-interval 30
+Project layout (recommended)
+realtime_yolo.py
 
-Repo Structure (suggested)
-.
-├── realtime_yolo.py
-├── models/
-│   └── yunet/
-│       └── face_detection_yunet_2023mar.onnx
-├── enrollments/               # opt-in user-provided face sets
-├── dataset/                   # opt-in collected face crops
-├── runs/                      # metrics outputs (csv)
-└── README.md
+models/
 
-Notes / Known Issues
+dataset/ (local, opt-in data)
 
-If you add DeepSORT or MediaPipe, pin numpy accordingly (separate venv recommended).
+enrollments/ (local, opt-in enrolled identities)
 
-Recognition is intended for opt-in enrolled identities only.
-
-Emotions CLI feature is bugged. 
+runs/ (local outputs like metrics CSV)
