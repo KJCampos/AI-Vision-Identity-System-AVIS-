@@ -37,7 +37,7 @@ dataset/
 datasets/
 enrollments/
 snapshots/
-
+runs/
 # ---- Large model files (download on setup) ----
 models/arcface/
 models/**/*.onnx
