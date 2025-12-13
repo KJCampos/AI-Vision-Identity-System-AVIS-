@@ -1,0 +1,50 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# ---- Virtual env ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- Local outputs ----
+runs/
+logs/
+*.log
+
+# ---- Local datasets / face crops (opt-in) ----
+dataset/
+datasets/
+enrollments/
+snapshots/
+
+# ---- Large model files (download on setup) ----
+models/arcface/
+models/**/*.onnx
+*.onnx
+*.pt
+*.pth
+
+# If you DO want to keep YuNet in the repo, uncomment these two lines and remove the onnx rules above
+# !models/yunet/face_detection_yunet_2023mar.onnx
+# !models/emotion/emotion-ferplus-8.onnx
