@@ -1,0 +1,66 @@
+# AVIS settings. Edit, save, and restart AVIS. Command-line flags still override these.
+# (The dashboard can edit this file too: Run Task > "AVIS: Dashboard".)
+
+camera:
+  source: 0                # 0 = built-in/USB webcam, 1 = second webcam,
+                           # or an IP camera: "rtsp://user:password@192.168.1.50:554/stream1"
+  target_width: 960        # frames wider than this are shrunk (faster)
+  device: auto             # auto = use your NVIDIA GPU if PyTorch has CUDA, else CPU
+  yolo_every: 1            # run person detection every N frames (2-3 saves CPU on slow PCs)
+
+recognition:
+  match_thresh: 0.363      # similarity needed to call a face a known person (evaluate.py can tune this)
+  recognize_every: 3       # check identity every N frames
+  min_face_score: 0.8      # only judge faces the detector is confident about
+  min_face_px: 56          # ...and that are at least this big (pixels)
+  faces_db: faces_db       # where enrolled face profiles live (never uploaded to GitHub)
+
+spoof_protection:
+  verify: gesture          # gesture = AVIS asks you for a random gesture (photos can't answer)
+                           # model = the ML spoof model (unreliable on this webcam) | none = trust any face
+  challenge_timeout_s: 10  # seconds to answer
+  challenge_fails: 3       # missed checks before a "gesture check failed" alert (+ snapshot)
+  verify_grace_s: 60       # stay verified this long if you look away
+  gesture_password: ""     # optional secret sequence, e.g. "peace,fist,thumbs_up"
+                           # (gestures: open, fist, point, peace, thumbs_up, three, four)
+  on_unlock_command: ""    # run this when the password is entered, e.g. "start notepad"
+  liveness: false          # OFF: the downloaded spoof model misjudged real faces on this webcam (scored Dr Campos 0.03).
+                           # Turn on after retraining it on your own clips.
+  liveness_thresh: 0.6     # balanced: real you scored 0.77-1.0, phone mostly ~0.0 (see spoof trial)
+  spoof_hits: 5            # failed checks in a row before a spoof alert
+  liveness_min_face_px: 90 # spoof-check only faces this wide or bigger (step back = recognized, not judged)
+
+learning:
+  learn: true              # confident, live sightings are added to your profile so it keeps improving
+  learn_min_sim: 0.55
+  max_samples: 300         # cap per person (enrollment samples are never replaced)
+  identity_model: models/identity/identity_mlp.pt   # trained by train_identity.py (GPU); used if present
+  model_min_prob: 0.6
+  auto_train: true         # retrain the identity network on your GPU after every session (background)
+  save_photos: true        # save face photos of recognized people: dataset/<name>/<date time run>/
+  photo_every_s: 1.0       # at most 1 photo per person per second (near-duplicates skipped)
+  max_photos_per_session: 150
+
+privacy:
+  anonymize: unknown       # none | all | unknown  (unknown = blur everyone except recognized enrolled people)
+  snapshot_days: 7         # auto-delete alert snapshots older than this (0 = keep forever)
+
+events:
+  events: true             # log to runs/events.csv (+ snapshots of unknown people / spoof attempts)
+  ntfy_topic: ""           # phone alerts: install the free ntfy app, subscribe to a hard-to-guess topic,
+                           # and put the same topic here, e.g. "avis-kj-7f3k29"
+  discord_webhook: ""      # or: Discord channel > Edit Channel > Integrations > Webhooks > Copy URL
+  alert_cooldown_s: 60
+  unknown_hits: 3          # unknown checks in a row before alerting (avoids false alarms)
+
+actions:
+  owner: Keanu   # your enrolled name
+  auto_lock: false         # true = lock Windows when you've been away from the camera for lock_after_s
+  lock_after_s: 60
+  on_recognized_command: ""     # e.g. "start spotify:"  ({name} = who was recognized)
+  command_cooldown_s: 300
+
+display:
+  debug: false             # true = show tracker stats, IDs, scores on screen
+  record: true             # true = every Live Camera run is also saved as recordings/AVIS Trial N.mp4
+                           # (the 'AVIS: Record Video' task always records). Stop with Q or the window's X to save.

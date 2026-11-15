@@ -2,6 +2,9 @@ import argparse
 import csv
 import logging
 import os
+import random
+import re
+import sys
 import time
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -11,24 +14,32 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Optional deps
-try:
-    import onnxruntime as ort
-except Exception:
-    ort = None
+from avis.actions import Presence
+from avis.camera import open_source
+from avis.config import apply_config
+from avis.events import EventLog
+from avis.learning import FaceDB, IdentityModel
+from avis.liveness import AntiSpoof
 
-try:
-    import mediapipe as mp
-except Exception:
-    mp = None
+CHALLENGES = ["peace", "thumbs_up", "open", "fist", "point"]   # most reliable gestures to read
 
-try:
-    from deep_sort_realtime.deepsort_tracker import DeepSort
-except Exception:
-    DeepSort = None
+# Optional features (--expression, --pose/--gaze, --tracker deepsort) import their
+# libraries only when turned on. See requirements-optional.txt.
 
 
 # ----------------- UTIL -----------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_path(path):
+    """Resolve relative model paths against the script folder, so it runs from any working directory."""
+    if path is None or os.path.isabs(path) or os.path.exists(path):
+        return path
+    candidate = os.path.join(SCRIPT_DIR, path)
+    return candidate if os.path.exists(candidate) else path
+
+
+
 def ensure_dir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path
@@ -161,6 +172,41 @@ class ArcFaceEmbedder:
         return vec
 
 
+def create_sface(model_path):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"SFace model not found at: {model_path}")
+    if hasattr(cv2, "FaceRecognizerSF_create"):
+        return cv2.FaceRecognizerSF_create(model_path, "")
+    return cv2.FaceRecognizerSF.create(model_path, "")
+
+
+def open_recorder(path, fps, size):
+    """MP4 writer. Prefers H.264 on Windows (plays on phones/Snapchat), falls back to mp4v."""
+    ensure_dir(os.path.dirname(path) or ".")
+    attempts = [(cv2.CAP_MSMF, "H264")] if sys.platform == "win32" else []
+    attempts.append((cv2.CAP_ANY, "mp4v"))
+    for api, cc in attempts:
+        w = cv2.VideoWriter(path, api, cv2.VideoWriter_fourcc(*cc), float(fps), size)
+        if w.isOpened():
+            return w, cc
+        w.release()
+    return None, None
+
+
+def next_trial_path(folder):
+    """recordings/AVIS Trial 1.mp4, AVIS Trial 2.mp4, ... (never overwrites)."""
+    ensure_dir(folder)
+    nums = [int(m.group(1)) for f in os.listdir(folder)
+            for m in [re.match(r"AVIS Trial (\d+)\.mp4$", f)] if m]
+    return os.path.join(folder, f"AVIS Trial {max(nums, default=0) + 1}.mp4")
+
+
+def sanitize_name(name):
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", (name or "").strip()).strip("_")
+    return name[:40]
+
+
+
 FERPLUS_LABELS = ["neutral", "happiness", "surprise", "sadness", "anger", "disgust", "fear", "contempt"]
 
 
@@ -169,8 +215,10 @@ class FerplusEmotion:
     FER+ ONNXRuntime runner (auto layout).
     """
     def __init__(self, model_path, norm="-11"):
-        if ort is None:
-            raise RuntimeError("onnxruntime not installed. pip install onnxruntime")
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise RuntimeError("--expression needs onnxruntime: pip install -r requirements-optional.txt")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Emotion model not found at: {model_path}")
 
@@ -219,8 +267,10 @@ class FaceMeshPoseGaze:
     MediaPipe FaceMesh pose + rough gaze.
     """
     def __init__(self):
-        if mp is None:
-            raise RuntimeError("mediapipe not installed. pip install mediapipe")
+        try:
+            import mediapipe as mp  # pyright: ignore[reportMissingImports]
+        except ImportError:
+            raise RuntimeError("--pose/--gaze needs mediapipe: pip install mediapipe")
 
         self.mp_face_mesh = mp.solutions.face_mesh
         self.mesh = self.mp_face_mesh.FaceMesh(
@@ -343,6 +393,10 @@ class Detection:
     from_detector: bool
     emb: Optional[np.ndarray] = None
     cam_id: int = 0
+    face_emb: Optional[np.ndarray] = None
+    aligned: Optional[np.ndarray] = None
+    face_box: Optional[Tuple[int, int, int, int]] = None
+    quality_ok: bool = True
 
 
 # ----------------- TRACK STATE (shared fields) -----------------
@@ -374,6 +428,29 @@ class TrackState:
         self.gaze = None
         self.pose_last_frame: int = 0
 
+        # Identity (enrolled face recognition)
+        self.name: Optional[str] = None
+        self.name_sim: float = 0.0
+        self.closest: Optional[str] = None
+
+        # Liveness (spoof protection) + event counters
+        self.live_ema: Optional[float] = None
+        self.live: Optional[bool] = None      # None = still checking
+        self.live_n = 0
+        self.spoof_hits = 0
+        self.unknown_hits = 0
+
+        # Gesture verification + gesture password
+        self.gesture_ok = False
+        self.challenge: Optional[str] = None
+        self.last_challenge: Optional[str] = None
+        self.ch_t0 = 0.0
+        self.ch_fails = 0
+        self.pw_idx = 0
+        self.pw_last: Optional[str] = None
+        self.pw_fails = 0
+        self.unlocked = False
+
         self._bbox = init_bbox_xyxy
 
     def set_bbox(self, bbox_xyxy, measured=True, from_detector=True):
@@ -388,6 +465,20 @@ class TrackState:
 
     def get_bbox(self):
         return self._bbox
+
+    def update_live(self, score, thresh, alpha=0.8):
+        if score is None:
+            return
+        self.live_n += 1
+        self.live_ema = score if self.live_ema is None else alpha * self.live_ema + (1 - alpha) * score
+        if self.live_n < 6:
+            return                                   # need 6 looks (~0.6 s) before deciding
+        if self.live is None:
+            self.live = self.live_ema >= thresh
+        elif self.live and self.live_ema < thresh - 0.15:  # a confirmed-live face needs sustained evidence to flip
+            self.live = False
+        elif not self.live and self.live_ema >= thresh:
+            self.live = True
 
     def update_embedding(self, emb, ema_alpha=0.85):
         if emb is None:
@@ -487,10 +578,8 @@ class KalmanBoxTrack(TrackState):
         self._bbox = bbox_xyxy
 
     def _state_to_bbox(self, state_vec):
-        x = float(state_vec[0])
-        y = float(state_vec[1])
-        w = float(state_vec[2])
-        h = float(state_vec[3])
+        v = np.asarray(state_vec).reshape(-1)
+        x, y, w, h = float(v[0]), float(v[1]), float(v[2]), float(v[3])
         return xywh_to_xyxy(x, y, max(1.0, w), max(1.0, h))
 
     def get_bbox(self):
@@ -589,8 +678,10 @@ class DeepSortWrapper:
     - accept frame or frame_bgr to avoid signature mismatch
     """
     def __init__(self, max_age=18, n_init=1):
-        if DeepSort is None:
-            raise RuntimeError("deep_sort_realtime not installed. pip install deep_sort_realtime")
+        try:
+            from deep_sort_realtime.deepsort_tracker import DeepSort
+        except ImportError:
+            raise RuntimeError("--tracker deepsort needs deep_sort_realtime: pip install -r requirements-optional.txt")
 
         self.max_age = int(max_age)
         self.ds = DeepSort(max_age=self.max_age, n_init=int(n_init))
@@ -737,7 +828,7 @@ class MetricsCSV:
             "people_count", "detections_count",
             "emotion", "emotion_conf",
             "yaw", "pitch", "roll", "gaze",
-            "fps"
+            "fps", "name"
         ])
         self.f.flush()
 
@@ -745,7 +836,7 @@ class MetricsCSV:
                   measured_now, from_detector, people_count, det_count,
                   emotion_label, emotion_conf,
                   yaw, pitch, roll, gaze,
-                  fps):
+                  fps, name=None):
         try:
             x1, y1, x2, y2 = bbox
         except Exception:
@@ -764,7 +855,8 @@ class MetricsCSV:
             (float(pitch) if pitch is not None else ""),
             (float(roll) if roll is not None else ""),
             (gaze if gaze else ""),
-            (float(fps) if fps is not None else "")
+            (float(fps) if fps is not None else ""),
+            (name if name else "")
         ])
 
     def flush(self):
@@ -781,13 +873,63 @@ class MetricsCSV:
             pass
 
 
+class SessionLog:
+    """
+    Clean per-frame log for cam 0 -> runs/<session>.csv (analyze with analyze_runs.py).
+    One row per frame, fixed columns, numbers only (names column is text),
+    empty cell only where a value genuinely doesn't exist (no face -> no similarity).
+    """
+    COLUMNS = ["time_s", "frame", "frame_ms", "fps_avg", "people", "faces", "tracks",
+               "tracks_measured", "tracks_predicted", "known", "unknown",
+               "best_similarity", "match_thresh", "names", "spoof", "verified"]
+
+    def __init__(self, path, match_thresh):
+        ensure_dir(os.path.dirname(path) or ".")
+        self.path = path
+        self.thresh = float(match_thresh)
+        self.t0 = None
+        self.f = open(path, "w", newline="", encoding="utf-8")
+        self.w = csv.writer(self.f)
+        self.w.writerow(self.COLUMNS)
+        self.f.flush()
+
+    def log(self, ts, frame_idx, frame_ms, fps, people, faces, tracks, meas, pred, names, sims, verified=0):
+        if self.t0 is None:
+            self.t0 = ts
+        known = sum(1 for n in names if n not in ("Unknown", "Spoof"))
+        spoof = sum(1 for n in names if n == "Spoof")
+        self.w.writerow([
+            round(ts - self.t0, 3), int(frame_idx), round(float(frame_ms), 2), round(float(fps), 2),
+            int(people), int(faces), int(tracks), int(meas), int(pred),
+            int(known), int(sum(1 for n in names if n == "Unknown")),
+            (round(max(sims), 4) if sims else ""), self.thresh,
+            ";".join(sorted(n for n in names if n not in ("Unknown", "Spoof"))),
+            int(spoof), int(verified),
+        ])
+        if frame_idx % 30 == 0:
+            self.f.flush()
+
+    def close(self):
+        try:
+            self.f.flush()
+            self.f.close()
+        except Exception:
+            pass
+
+
 # ----------------- CLI -----------------
 def build_arg_parser():
     p = argparse.ArgumentParser(
         description="AVIS: YOLO person -> head ROI -> YuNet faces -> Kalman/DeepSORT + Emotion + Pose/Gaze + ReID + Fusion + CSV"
     )
 
+    p.add_argument("--config", type=str, default="config.yaml", help="Settings file (command-line flags override it).")
+
     # input
+    p.add_argument("--source", type=str, default=None,
+                   help="Webcam index (0), IP camera URL (rtsp://user:pass@ip:554/stream), or video file.")
+    p.add_argument("--device", type=str, default="auto", help="auto / cuda / cpu for YOLO.")
+    p.add_argument("--yolo-every", type=int, default=1, help="Run person detection every N frames (reuse boxes between).")
     p.add_argument("--video", type=str, default=None, help="Path to input video file (single stream).")
     p.add_argument("--camera", action="append", type=int, default=[], help="Camera index (repeatable). Example: --camera 0 --camera 1")
     p.add_argument("--target-width", type=int, default=960, help="Resize frames so width <= this value.")
@@ -806,11 +948,13 @@ def build_arg_parser():
 
     # collection
     p.add_argument("--collect-label", type=str, default="keanu", help="Label folder for saved faces.")
-    p.add_argument("--no-collect", action="store_true", help="Disable saving face crops.")
+    p.add_argument("--collect", action="store_true", help="Opt-in: save face crops to dataset/<label>/.")
+    p.add_argument("--no-collect", action="store_true", help="(Default) Do not save face crops. Kept for old commands.")
     p.add_argument("--save-every", type=int, default=2, help="Save a face crop every N frames (MEAS only).")
 
     # anonymize
-    p.add_argument("--anonymize", type=str, default="none", choices=["none", "all"], help="Anonymize mode.")
+    p.add_argument("--anonymize", type=str, default="none", choices=["none", "all", "unknown"],
+                   help="Pixelate faces: none, all, or unknown (everyone except recognized enrolled people).")
     p.add_argument("--pixel-blocks", type=int, default=14, help="Pixelation strength.")
 
     # expression
@@ -831,6 +975,73 @@ def build_arg_parser():
     p.add_argument("--reid-thresh", type=float, default=0.55, help="Cosine similarity threshold for global ID match.")
     p.add_argument("--fusion", action="store_true", help="Show fusion HUD on cam0.")
 
+    # identity: enroll + recognize
+    p.add_argument("--enroll", type=str, default=None, help="Enroll this person's face (e.g. --enroll KJ). Only one face should be in view.")
+    p.add_argument("--enroll-samples", type=int, default=20, help="Face samples to capture when enrolling.")
+    p.add_argument("--sface-model", type=str, default="models/sface/face_recognition_sface_2021dec.onnx", help="SFace ONNX path.")
+    p.add_argument("--faces-db", type=str, default="faces_db", help="Folder where enrolled faces are stored.")
+    p.add_argument("--match-thresh", type=float, default=0.363, help="Cosine similarity needed to call a face a known person.")
+    p.add_argument("--recognize-every", type=int, default=3, help="Run recognition every N frames.")
+    p.add_argument("--no-recognize", action="store_true", help="Disable face recognition.")
+    p.add_argument("--min-face-score", type=float, default=0.8, help="Face detector confidence needed to judge identity/liveness.")
+    p.add_argument("--min-face-px", type=int, default=56, help="Smallest face (pixels) to judge identity/liveness.")
+
+    # spoof protection
+    BO = argparse.BooleanOptionalAction
+    p.add_argument("--verify", type=str, default="gesture", choices=["gesture", "model", "none"],
+                   help="How a recognized face proves it's live: gesture challenge, the ML spoof model, or none.")
+    p.add_argument("--challenge-timeout-s", type=float, default=10, help="Seconds to answer a gesture challenge.")
+    p.add_argument("--challenge-fails", type=int, default=3, help="Missed challenges before a 'check failed' alert.")
+    p.add_argument("--verify-grace-s", type=float, default=60, help="Stay verified this long after looking away.")
+    p.add_argument("--gesture-password", type=str, default="", help="Secret gesture sequence, e.g. 'peace,fist,thumbs_up'.")
+    p.add_argument("--on-unlock-command", type=str, default="", help="Command to run when the gesture password is entered.")
+    p.add_argument("--liveness", action=BO, default=True, help="Spoof protection (reject photos/screens).")
+    p.add_argument("--liveness-model", type=str, default="models/antispoof/AntiSpoofing_bin_1.5_128.onnx")
+    p.add_argument("--liveness-thresh", type=float, default=0.45, help="Real-face probability needed to count as live.")
+    p.add_argument("--liveness-min-face-px", type=int, default=90,
+                   help="Only run the spoof check on faces at least this wide (far faces are too blurry).")
+    p.add_argument("--liveness-warmup-s", type=float, default=2.0, help="Skip spoof checks while the webcam adjusts exposure.")
+    p.add_argument("--enroll-liveness", action=BO, default=False,
+                   help="Also require the spoof check while enrolling (off: you supervise enrollment).")
+    p.add_argument("--spoof-hits", type=int, default=5, help="Failed checks in a row before raising a spoof event.")
+
+    # learning / ML
+    p.add_argument("--learn", action=BO, default=True, help="Add confident, live sightings to the person's profile.")
+    p.add_argument("--learn-min-sim", type=float, default=0.55, help="Similarity needed before a sighting is learned.")
+    p.add_argument("--max-samples", type=int, default=300, help="Max samples per person profile.")
+    p.add_argument("--identity-model", type=str, default="models/identity/identity_mlp.pt",
+                   help="Trained identity model (train_identity.py). Used if it exists.")
+    p.add_argument("--model-min-prob", type=float, default=0.6, help="Model confidence needed to confirm a match.")
+    p.add_argument("--save-photos", action=BO, default=True,
+                   help="Save face photos of recognized enrolled people, one folder per run (dataset/<name>/<date time run>/).")
+    p.add_argument("--photo-every-s", type=float, default=1.0, help="At most one photo per person every N seconds.")
+    p.add_argument("--max-photos-per-session", type=int, default=150, help="Cap per person per run.")
+    p.add_argument("--auto-train", action=BO, default=True,
+                   help="After each session, retrain the identity model on the GPU in the background.")
+
+    # events + alerts
+    p.add_argument("--events", action=BO, default=True, help="Write runs/events.csv + snapshots.")
+    p.add_argument("--ntfy-topic", type=str, default="", help="ntfy topic or URL for phone alerts (empty = off).")
+    p.add_argument("--discord-webhook", type=str, default="", help="Discord webhook URL for alerts (empty = off).")
+    p.add_argument("--alert-cooldown-s", type=float, default=60, help="Min seconds between alerts of the same kind.")
+    p.add_argument("--seen-cooldown-s", type=float, default=300, help="Min seconds between 'X recognized' log entries.")
+    p.add_argument("--unknown-hits", type=int, default=3, help="Unknown checks in a row before an unknown-person event.")
+    p.add_argument("--snapshot-days", type=int, default=7, help="Delete snapshots older than this (0 = keep).")
+
+    # actions
+    p.add_argument("--owner", type=str, default="", help="Your enrolled name (for auto-lock).")
+    p.add_argument("--auto-lock", action=BO, default=False, help="Lock Windows when the owner is away.")
+    p.add_argument("--lock-after-s", type=float, default=60, help="Seconds without seeing the owner before locking.")
+    p.add_argument("--on-recognized-command", type=str, default="", help="Command to run when someone is recognized ({name}).")
+    p.add_argument("--command-cooldown-s", type=float, default=300)
+
+    # recording
+    p.add_argument("--record", nargs="?", const="auto", default=None,
+                   help="Save the video as MP4 (default: recordings/AVIS Trial N.mp4). Uses the clean overlay.")
+    p.add_argument("--debug", action="store_true", help="Show debug overlay (tracker stats, IDs, MEAS/PRED, scores).")
+
+    p.add_argument("--no-log", action="store_true", help="Don't write the per-frame session CSV in runs/.")
+
     # metrics
     p.add_argument("--eval-csv", type=str, default=None, help="Write per-track metrics rows to this CSV.")
 
@@ -840,24 +1051,147 @@ def build_arg_parser():
     return p
 
 
+def start_auto_train(face_db, args):
+    """Retrain the identity network in the background (own process) so AVIS closes instantly."""
+    mp = resolve_path(args.identity_model) if args.identity_model else None
+    changed = True    # new photos / learned samples every run -> retrain (takes seconds on the GPU)
+    if not changed or mp is None:
+        return
+    unknown_dir = os.path.join(SCRIPT_DIR, "eval", "unknown")
+    has_negatives = os.path.isdir(unknown_dir) and any(os.scandir(unknown_dir))
+    if len(face_db.people) + int(has_negatives) < 2:
+        logging.info("[ML] auto-train waiting: needs a 2nd enrolled person or an eval/unknown clip "
+                     "(Run Task > AVIS: Record Test Clip > unknown).")
+        return
+    import subprocess
+    log_path = os.path.join(SCRIPT_DIR, "runs", "identity_training.log")
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+    with open(log_path, "w", encoding="utf-8") as log:
+        subprocess.Popen([sys.executable, os.path.join(SCRIPT_DIR, "train_identity.py"), "--out", mp],
+                         cwd=SCRIPT_DIR, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
+    logging.info(f"[ML] retraining identity model on the GPU in the background -> {os.path.relpath(log_path, SCRIPT_DIR)}")
+
+
 # ----------------- MAIN -----------------
 def main():
-    args = build_arg_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    parser = build_arg_parser()
+    pre, _ = parser.parse_known_args()
+    cfg_path = resolve_path(pre.config) if pre.config else None
+    if cfg_path and not os.path.isabs(cfg_path):
+        cfg_path = os.path.join(SCRIPT_DIR, cfg_path)
+    if apply_config(parser, cfg_path):
+        logging.info(f"[CONFIG] loaded {cfg_path}")
+    args = parser.parse_args()
 
-    if not args.camera and not args.video:
-        args.camera = [0]
+    if args.source is not None and str(args.source).strip() != "":
+        sources = [args.source]
+    elif args.video:
+        sources = [args.video]
+    else:
+        sources = args.camera or [0]
 
-    if args.tracker == "deepsort" and DeepSort is None:
-        raise RuntimeError("DeepSORT requested but deep_sort_realtime is not installed.")
+    # compute device (GPU if available)
+    device, half = "cpu", False
+    try:
+        import torch
+        if args.device in ("auto", "cuda") and torch.cuda.is_available():
+            device, half = 0, True
+            logging.info(f"[GPU] YOLO on {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda}, half precision)")
+        elif args.device == "cuda":
+            logging.warning("[GPU] CUDA requested but not available; using CPU.")
+    except ImportError:
+        pass
+    if device == "cpu":
+        logging.info("[GPU] YOLO on CPU")
 
     # init models
-    yolo = YOLO("yolov8n.pt")
-    yunet = create_yunet(args.yunet_model, score_thresh=args.yunet_score, nms_thresh=args.yunet_nms, top_k=5000)
+    yolo = YOLO(resolve_path("yolov8n.pt"))
+    yunet = create_yunet(resolve_path(args.yunet_model), score_thresh=args.yunet_score, nms_thresh=args.yunet_nms, top_k=5000)
+
+    # identity
+    sface = None
+    face_db = None
+    enroll_name = None
+    enroll_embs: List[np.ndarray] = []
+    if not args.no_recognize or args.enroll:
+        face_db = FaceDB(args.faces_db if os.path.isabs(args.faces_db) else os.path.join(SCRIPT_DIR, args.faces_db),
+                         max_samples=args.max_samples)
+        sface = create_sface(resolve_path(args.sface_model))
+        logging.info(f"[ID] known people: {sorted(face_db.people.keys()) or 'none yet'}")
+    if args.verify == "model":
+        args.liveness = True
+    antispoof = None
+    if sface is not None and args.liveness:
+        try:
+            antispoof = AntiSpoof(resolve_path(args.liveness_model))
+        except (RuntimeError, FileNotFoundError) as e:
+            logging.warning(f"[LIVE] spoof protection OFF: {e}")
+
+    identity_model = None
+    model_path = resolve_path(args.identity_model) if args.identity_model else None
+    if sface is not None and model_path and os.path.exists(model_path):
+        try:
+            identity_model = IdentityModel(model_path)
+            missing = sorted(set(face_db.people) - set(identity_model.classes))
+            if missing:
+                logging.warning(f"[ML] model doesn't know {missing}; retrain with train_identity.py. Ignoring model.")
+                identity_model = None
+        except Exception as e:
+            logging.warning(f"[ML] could not load identity model: {e}")
+
+    events = None
+    if args.events:
+        events = EventLog(os.path.join(SCRIPT_DIR, "runs"), ntfy_topic=args.ntfy_topic,
+                          discord_webhook=args.discord_webhook, alert_cooldown_s=args.alert_cooldown_s,
+                          snapshot_days=args.snapshot_days)
+    presence = Presence(owner=args.owner, auto_lock=args.auto_lock, lock_after_s=args.lock_after_s,
+                        command=args.on_recognized_command, command_cooldown_s=args.command_cooldown_s,
+                        events=events)
+    enroll_note = ""
+
+    # hand tracking for gesture verification / password
+    password = [g.strip().lower() for g in (args.gesture_password or "").split(",") if g.strip()]
+    hand_tracker, hand_stable = None, {}
+    if sface is not None and (args.verify == "gesture" or password):
+        try:
+            from avis.hands import HandTracker
+            hand_tracker = HandTracker()
+            logging.info(f"[VERIFY] gesture check on ({args.challenge_timeout_s:.0f}s to answer)"
+                         + (f", gesture password of {len(password)} steps" if password else ""))
+        except Exception as e:
+            logging.warning(f"[VERIFY] hand tracking unavailable ({e}); gesture check OFF")
+            if args.verify == "gesture":
+                args.verify = "none"
+    verified_until: Dict[str, float] = {}
+    pstate: Dict[str, dict] = {}     # per PERSON (survives the face being re-detected): fails, password progress
+
+    def person(name):
+        st = pstate.setdefault(name, {"fails": 0, "fail_t": 0.0, "pw_idx": 0, "pw_last": None, "pw_fails": 0, "unlocked_until": 0.0})
+        if time.time() - st["fail_t"] > 120:          # forget old misses after 2 minutes
+            st["fails"] = 0
+        return st
+
+    def verified_ok(t):
+        if t is None:
+            return False
+        if args.verify == "gesture":
+            return bool(t.gesture_ok)
+        if args.verify == "model":
+            return antispoof is None or bool(t.live)
+        return True
+
+    if args.enroll:
+        enroll_name = sanitize_name(args.enroll)
+        if not enroll_name:
+            raise RuntimeError("--enroll needs a name with letters or numbers.")
+        logging.info(f"[ID] enrolling '{enroll_name}': look at the camera, turn your head a little.")
 
     emotion = None
     if args.expression:
-        emotion = FerplusEmotion(args.emotion_model, norm=args.emotion_norm)
+        emotion = FerplusEmotion(resolve_path(args.emotion_model), norm=args.emotion_norm)
 
     pose_gaze = None
     if args.pose or args.gaze:
@@ -868,7 +1202,7 @@ def main():
     if args.reid:
         if not args.arcface_model:
             raise RuntimeError("--reid requires --arcface-model path/to/arcface.onnx")
-        embedder = ArcFaceEmbedder(args.arcface_model, input_size=112)
+        embedder = ArcFaceEmbedder(resolve_path(args.arcface_model), input_size=112)
         global_reid = GlobalReID(sim_thresh=args.reid_thresh, ttl_frames=180)
 
     # metrics
@@ -877,29 +1211,20 @@ def main():
         logging.info(f"[METRICS] writing -> {args.eval_csv}")
 
     # collection
-    collect_faces = not args.no_collect
+    collect_faces = args.collect and not args.no_collect
+    session = now_stamp()
     save_dir = None
     saved_count = 0
     if collect_faces:
         save_dir = ensure_dir(os.path.join("dataset", args.collect_label))
         logging.info(f"[COLLECT] enabled -> {save_dir}")
 
-    # capture(s)
-    caps: Dict[int, cv2.VideoCapture] = {}
-
-    if args.camera:
-        for cam_id, cam_idx in enumerate(args.camera):
-            cap = cv2.VideoCapture(cam_idx, cv2.CAP_AVFOUNDATION)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open camera index {cam_idx}")
-            caps[cam_id] = cap
-        logging.info(f"[INPUT] cameras: {args.camera}")
-    else:
-        cap = cv2.VideoCapture(args.video)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video: {args.video}")
-        caps[0] = cap
-        logging.info(f"[INPUT] video: {args.video}")
+    # capture(s): webcam index, IP camera URL, or file
+    caps: Dict[int, object] = {}
+    for cam_id, src in enumerate(sources):
+        caps[cam_id] = open_source(src)
+        shown = re.sub(r"//[^@/]*@", "//***@", str(src))   # hide camera passwords in logs
+        logging.info(f"[INPUT] cam{cam_id}: {shown}")
 
     # trackers per cam
     trackers: Dict[int, object] = {}
@@ -909,9 +1234,51 @@ def main():
         else:
             trackers[cam_id] = DeepSortWrapper(max_age=args.max_age, n_init=1)
 
+    # recording (cam 0 only); opened after a few frames so the video plays at real speed
+    recorder = None
+    record_path = None
+    if args.record in (True, "true", "True"):
+        args.record = "auto"
+    if args.record in (False, "false", "False", "", "none"):
+        args.record = None
+    if args.record:
+        record_path = args.record if args.record != "auto" else next_trial_path(os.path.join(SCRIPT_DIR, "recordings"))
+        logging.info(f"[REC] will record to {record_path}")
+
+    clean_hud = not args.debug
+
+    # one photo folder per run: dataset/<name>/<YYYY-MM-DD HH-MM-SS> <run name>/
+    run_label = (os.path.splitext(os.path.basename(record_path))[0] if record_path
+                 else ("Enrollment" if args.enroll else "Live session"))
+    session_folder = f"{time.strftime('%Y-%m-%d %H-%M-%S')} {run_label}"
+    photo_state: Dict[str, dict] = {}
+
+    def save_face_photo(name, aligned, emb=None):
+        """Save one aligned face crop to this run's folder; skips near-duplicates. Returns True if saved."""
+        st = photo_state.setdefault(name, {"n": 0, "last_t": 0.0, "last_emb": None})
+        if aligned is None or st["n"] >= args.max_photos_per_session:
+            return False
+        if emb is not None and st["last_emb"] is not None and float(st["last_emb"] @ emb) > 0.97:
+            return False
+        folder = ensure_dir(os.path.join(SCRIPT_DIR, "dataset", name, session_folder))
+        st["n"] += 1
+        cv2.imwrite(os.path.join(folder, f"{time.strftime('%H-%M-%S')}_{st['n']:03d}.jpg"), aligned)
+        st["last_t"] = time.time()
+        st["last_emb"] = emb
+        return True
+
+    session_log = None
+    if not args.no_log:
+        base = os.path.splitext(os.path.basename(record_path))[0] if record_path else time.strftime("Session %Y-%m-%d %H-%M-%S")
+        session_log = SessionLog(os.path.join(SCRIPT_DIR, "runs", base + ".csv"), args.match_thresh)
+        logging.info(f"[LOG] stats -> {session_log.path}")
+
     frame_idx = 0
     last_time = time.time()
     fps = 0.0
+    last_people: Dict[int, list] = {}
+    shown_windows: set = set()
+    session_t0 = time.time()
 
     try:
         while True:
@@ -921,7 +1288,7 @@ def main():
                 ret, frame = cap.read()
                 frames[cam_id] = frame if ret else None
 
-            if len(frames) == 1 and list(frames.values())[0] is None:
+            if all(f is None for f in frames.values()):
                 logging.info("End of stream.")
                 break
 
@@ -929,6 +1296,7 @@ def main():
 
             now = time.time()
             dt = now - last_time
+            frame_ms = max(dt * 1000.0, 0.01)
             last_time = now
             if dt > 1e-6:
                 fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
@@ -945,14 +1313,19 @@ def main():
                     s = args.target_width / w
                     frame = cv2.resize(frame, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
                 frames[cam_id] = frame
+                clean = frame.copy()
                 H, W = frame.shape[:2]
 
-                # YOLO persons
-                yres = yolo(frame, conf=args.conf, classes=[0])[0]
+                # YOLO persons (every yolo_every frames; reuse boxes in between)
+                if args.yolo_every <= 1 or frame_idx % args.yolo_every == 0 or cam_id not in last_people:
+                    yres = yolo(frame, conf=args.conf, classes=[0], verbose=False, device=device, half=half)[0]
+                    yboxes = [b.xyxy[0].tolist() for b in yres.boxes]
+                else:
+                    yboxes = last_people[cam_id]
+                last_people[cam_id] = yboxes
                 people = []
-                for b in yres.boxes:
-                    x1, y1, x2, y2 = b.xyxy[0].tolist()
-                    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, W, H)
+                for xyxy in yboxes:
+                    x1, y1, x2, y2 = clamp_bbox(*xyxy, W, H)
 
                     # basic filters so you don't spam tiny boxes
                     ar = (x2 - x1) / max(1, (y2 - y1))
@@ -990,11 +1363,39 @@ def main():
                         fy1 = hy1 + int(fy)
                         fx2 = fx1 + int(fw)
                         fy2 = fy1 + int(fh)
+                        raw_box = (fx1, fy1, fx2, fy2)
 
                         pad = int(0.15 * max(float(fw), float(fh)))
                         fx1, fy1, fx2, fy2 = expand_bbox(fx1, fy1, fx2, fy2, pad, W, H)
 
                         conf = float(best[14]) if len(best) > 14 else 0.9
+
+                        # face quality gate: only judge identity / liveness on a clearly visible face
+                        # (cap brim, looking down, turned away, too small -> "can't see face", not "spoof")
+                        eye_dist = float(np.hypot(best[6] - best[4], best[7] - best[5]))
+                        quality_ok = (conf >= args.min_face_score and min(fw, fh) >= args.min_face_px
+                                      and eye_dist >= 0.28 * float(fw))
+
+                        # face embedding for identity (enroll / recognize)
+                        face_emb = None
+                        aligned = None
+                        want_id = sface is not None and (
+                            enroll_name is not None
+                            or (face_db.people and args.recognize_every > 0 and frame_idx % args.recognize_every == 0)
+                        )
+                        if want_id:
+                            row = np.array(best[:15], dtype=np.float32).copy()
+                            row[0] += hx1
+                            row[1] += hy1
+                            row[4:14:2] += hx1
+                            row[5:14:2] += hy1
+                            try:
+                                aligned = sface.alignCrop(clean, row)
+                                face_emb = sface.feature(aligned).reshape(-1).astype(np.float32)
+                                n = np.linalg.norm(face_emb)
+                                face_emb = face_emb / n if n > 1e-9 else None
+                            except cv2.error:
+                                face_emb = None
 
                         emb = None
                         if args.reid and embedder is not None and args.reid_every > 0 and (frame_idx % args.reid_every == 0):
@@ -1006,8 +1407,44 @@ def main():
                             conf=conf,
                             from_detector=True,
                             emb=emb,
-                            cam_id=cam_id
+                            cam_id=cam_id,
+                            face_emb=face_emb,
+                            aligned=aligned,
+                            face_box=raw_box,
+                            quality_ok=quality_ok,
                         ))
+
+                # hands -> stable gestures (for gesture verification / password)
+                hand_list = []
+                if hand_tracker is not None and cam_id == 0:
+                    from avis.hands import features as hand_features, classify as classify_gesture, StableGesture
+                    seen_keys = set()
+                    for i, (lab, hpts) in enumerate(hand_tracker(clean)):
+                        hf = hand_features(hpts)
+                        key = f"{lab}{i}"
+                        seen_keys.add(key)
+                        sg = hand_stable.setdefault(key, StableGesture(4))
+                        hand_list.append((hpts, hf, sg.update(classify_gesture(hf, sg.state))))
+                    for key in [k for k in hand_stable if k not in seen_keys]:
+                        del hand_stable[key]          # hand left the frame: forget its last gesture
+
+                # enrollment: needs exactly one face in view
+                id_dets = [d for d in detections if d.face_emb is not None and d.quality_ok]
+                if enroll_name is not None and cam_id == 0:
+                    live_ok = True
+                    if len(id_dets) == 1 and frame_idx % 3 == 0 and antispoof is not None and args.enroll_liveness:
+                        ls = antispoof.score(clean, id_dets[0].face_box)
+                        live_ok = ls is not None and ls >= args.liveness_thresh
+                        enroll_note = "" if live_ok else "  (not a live face - photo/screen?)"
+                    if len(id_dets) == 1 and frame_idx % 3 == 0 and live_ok:
+                        enroll_embs.append(id_dets[0].face_emb)
+                        photo_state.setdefault(enroll_name, {"n": 0, "last_t": 0.0, "last_emb": None})["last_emb"] = None
+                        save_face_photo(enroll_name, id_dets[0].aligned)
+                    if len(enroll_embs) >= args.enroll_samples:
+                        face_db.add(enroll_name, enroll_embs)
+                        logging.info(f"[ID] saved {len(enroll_embs)} samples for '{enroll_name}' -> {face_db.folder}")
+                        enroll_name = None
+                        enroll_embs = []
 
                 # tracker update (UNIFIED API)
                 tracks_out, _meta = trackers[cam_id].update(detections, frame_bgr=frame, frame_idx=frame_idx)
@@ -1015,6 +1452,9 @@ def main():
                 # update per-track optional modules (MEAS only)
                 meas_tracks = 0
                 pred_tracks = 0
+                frame_names: List[str] = []
+                frame_sims: List[float] = []
+                frame_verified = set()          # known people who passed the spoof check this frame
 
                 for tid, bbox in tracks_out.items():
                     x1, y1, x2, y2 = clamp_bbox(*bbox, W, H)
@@ -1031,18 +1471,14 @@ def main():
                     else:
                         pred_tracks += 1
 
-                    # anonymize
-                    if args.anonymize == "all":
-                        pixelate(frame, x1, y1, x2, y2, blocks=args.pixel_blocks)
-
                     # collection (MEAS only)
                     if collect_faces and measured_now and args.save_every > 0 and (frame_idx % args.save_every == 0):
-                        gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                        out_path = os.path.join(save_dir, f"cam{cam_id}_img_{saved_count:05d}.jpg")
+                        gray = cv2.cvtColor(clean[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                        out_path = os.path.join(save_dir, f"{session}_cam{cam_id}_img_{saved_count:05d}.jpg")
                         cv2.imwrite(out_path, gray)
                         saved_count += 1
 
-                    face_crop = frame[y1:y2, x1:x2]
+                    face_crop = clean[y1:y2, x1:x2]
 
                     # emotion update
                     if measured_now and args.expression and emotion is not None and args.emotion_every > 0 and (frame_idx % args.emotion_every == 0):
@@ -1069,11 +1505,137 @@ def main():
                         gid = global_reid.assign(cam_id, tid, trk_state.emb_ema, frame_idx)
                         trk_state.global_id = gid
 
+                    # identity: match this track to the closest face detection, then look it up
+                    if measured_now and trk_state is not None and face_db is not None and face_db.people and id_dets:
+                        best_det = max(id_dets, key=lambda d: iou_xyxy((x1, y1, x2, y2), d.bbox_xyxy))
+                        if iou_xyxy((x1, y1, x2, y2), best_det.bbox_xyxy) > 0.3:
+                            who, sim, closest = face_db.match(best_det.face_emb, args.match_thresh)
+
+                            # spoof protection
+                            live_score = None
+                            fb = best_det.face_box
+                            big_enough = fb is not None and (fb[2] - fb[0]) >= args.liveness_min_face_px
+                            warm = (time.time() - session_t0) >= args.liveness_warmup_s   # webcam exposure settling
+                            if antispoof is not None and big_enough and warm:  # small/far faces are too blurry to judge
+                                live_score = antispoof.score(clean, fb)
+                                trk_state.update_live(live_score, args.liveness_thresh)
+
+                            # ML model must agree with the similarity match
+                            if who and identity_model is not None:
+                                m_label, m_prob = identity_model.predict(best_det.face_emb)
+                                if m_label != who or m_prob < args.model_min_prob:
+                                    who = None
+
+                            trk_state.name_sim = sim
+                            trk_state.closest = closest
+                            if antispoof is not None and trk_state.live is None and big_enough and warm:
+                                trk_state.name = None                      # close enough to check: wait for verdict
+                            elif antispoof is not None and trk_state.live is False:
+                                trk_state.name = "Spoof"
+                                trk_state.spoof_hits += 1
+                                trk_state.unknown_hits = 0
+                            else:
+                                trk_state.name = who or "Unknown"
+                                trk_state.spoof_hits = 0
+                                trk_state.unknown_hits = 0 if who else trk_state.unknown_hits + 1
+
+                            # photos: verified enrolled people, one folder per run (for training / review)
+                            if (args.save_photos and who and trk_state.name == who
+                                    and verified_ok(trk_state)
+                                    and time.time() - photo_state.get(who, {}).get("last_t", 0) >= args.photo_every_s):
+                                save_face_photo(who, best_det.aligned, best_det.face_emb)
+
+                            # learn: confident + live sightings improve the profile over time
+                            if args.learn and who and trk_state.name == who and verified_ok(trk_state):
+                                face_db.maybe_learn(who, best_det.face_emb, sim, min_sim=args.learn_min_sim)
+
+                            # events / alerts
+                            if events is not None:
+                                if trk_state.name == "Spoof" and trk_state.spoof_hits >= args.spoof_hits:
+                                    events.emit("spoof", closest if sim >= args.match_thresh else "", sim, live_score,
+                                                clean, best_det.bbox_xyxy, key=("spoof",))
+                                elif trk_state.name == "Unknown" and trk_state.unknown_hits >= args.unknown_hits:
+                                    events.emit("unknown", "", sim, live_score, clean, best_det.bbox_xyxy, key=("unknown",))
+                                elif who and trk_state.name == who and verified_ok(trk_state):
+                                    events.emit("seen", who, sim, live_score, key=("seen", who),
+                                                cooldown_s=args.seen_cooldown_s)
+
+                    # gesture verification + gesture password (for recognized enrolled people)
+                    if (hand_tracker is not None and trk_state is not None and measured_now
+                            and trk_state.name not in (None, "Unknown", "Spoof")):
+                        now_t = time.time()
+                        fwid, fcx = max(1, x2 - x1), (x1 + x2) / 2
+                        mine = [h for h in hand_list if abs(h[0][0][0] - fcx) < 3.2 * fwid and h[0][0][1] > y1 - fwid]
+                        hand_g = min(mine, key=lambda h: abs(h[0][0][0] - fcx))[2] if mine else None
+                        if args.verify == "gesture" and not trk_state.gesture_ok:
+                            if verified_until.get(trk_state.name, 0) > now_t:          # verified a moment ago
+                                trk_state.gesture_ok = True
+                            else:
+                                if trk_state.challenge is None:
+                                    trk_state.challenge = random.choice([c for c in CHALLENGES if c != trk_state.last_challenge])
+                                    trk_state.ch_t0 = now_t
+                                if hand_g == trk_state.challenge:
+                                    trk_state.gesture_ok, trk_state.challenge = True, None
+                                    if events is not None:
+                                        events.emit("verified", trk_state.name, trk_state.name_sim, key=("verified", trk_state.name),
+                                                    cooldown_s=args.seen_cooldown_s)
+                                elif now_t - trk_state.ch_t0 > args.challenge_timeout_s:
+                                    ps = person(trk_state.name)
+                                    ps["fails"] += 1
+                                    ps["fail_t"] = now_t
+                                    trk_state.last_challenge, trk_state.challenge = trk_state.challenge, None
+                                    if ps["fails"] >= args.challenge_fails and events is not None:
+                                        events.emit("challenge_failed", trk_state.name, trk_state.name_sim, None, clean,
+                                                    (x1, y1, x2, y2), key=("challenge_failed",))
+                        if trk_state.gesture_ok:
+                            verified_until[trk_state.name] = now_t + args.verify_grace_s
+                        ps = person(trk_state.name)
+                        trk_state.unlocked = ps["unlocked_until"] > now_t
+                        if password and verified_ok(trk_state) and not trk_state.unlocked:
+                            if hand_g in (None, "none", "other"):
+                                ps["pw_last"] = None                     # hand lowered: next gesture can register
+                            elif hand_g != ps["pw_last"]:
+                                ps["pw_last"] = hand_g
+                                if hand_g == password[ps["pw_idx"]]:
+                                    ps["pw_idx"] += 1
+                                    if ps["pw_idx"] == len(password):
+                                        ps["unlocked_until"] = now_t + args.verify_grace_s
+                                        ps["pw_idx"] = 0
+                                        trk_state.unlocked = True
+                                        if events is not None:
+                                            events.emit("unlocked", trk_state.name, cooldown_s=0)
+                                        if args.on_unlock_command:
+                                            import subprocess
+                                            subprocess.Popen(args.on_unlock_command.replace("{name}", trk_state.name), shell=True)
+                                else:
+                                    ps["pw_idx"] = 1 if hand_g == password[0] else 0
+                                    ps["pw_fails"] += 1
+                                    if ps["pw_fails"] >= 3 and events is not None:
+                                        events.emit("password_failed", trk_state.name, cooldown_s=60)
+
+                    # log identity for every measured face (keeps its last result between checks)
+                    if measured_now and trk_state is not None and trk_state.name:
+                        frame_names.append(trk_state.name)
+                        frame_sims.append(float(trk_state.name_sim))
+                        if trk_state.name not in ("Unknown", "Spoof") and verified_ok(trk_state):
+                            frame_verified.add(trk_state.name)
+
+                    tname = trk_state.name if trk_state is not None else None
+                    known_person = bool(tname) and tname not in ("Unknown", "Spoof")
+
                     # draw box (GREEN if measured_now else YELLOW)
                     status = "MEAS" if measured_now else "PRED"
                     color = (0, 255, 0) if measured_now else (0, 255, 255)
 
                     label = f"C{cam_id} ID{tid} {status}"
+                    if trk_state is not None and trk_state.name:
+                        label = f"{trk_state.name} ({trk_state.name_sim:.2f}) | " + label
+                        if known_person:
+                            color = (255, 200, 0)  # known person = blue
+                        elif trk_state.name == "Spoof":
+                            color = (0, 0, 255)
+                    if trk_state is not None and trk_state.live_ema is not None:
+                        label += f" | live {trk_state.live_ema:.2f}"
                     if trk_state is not None and trk_state.global_id is not None:
                         label += f" | G{trk_state.global_id}"
 
@@ -1085,9 +1647,48 @@ def main():
                         if args.gaze and trk_state.gaze:
                             label += f" gaze:{trk_state.gaze}"
 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, label, (x1, max(10, y1 - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+                    # privacy: pixelate faces (all, or everyone who isn't a recognized enrolled person)
+                    if args.anonymize == "all" or (args.anonymize == "unknown" and not known_person):
+                        pixelate(frame, x1, y1, x2, y2, blocks=args.pixel_blocks)
+
+                    if clean_hud:
+                        # recording look: box + name tag only
+                        who = tname
+                        if who == "Spoof":
+                            color, tag = (0, 0, 255), "SPOOF?"
+                        elif who is None and antispoof is not None and face_db is not None and face_db.people:
+                            color, tag = (160, 160, 160), ""        # still checking
+                        elif known_person and not verified_ok(trk_state):
+                            color = (0, 215, 255) if args.verify == "gesture" else (190, 160, 90)
+                            tag = who.replace("_", " ") + "?"                      # recognized, not verified yet
+                        else:
+                            color = (255, 200, 0) if known_person else (0, 255, 0)
+                            tag = who.replace("_", " ") if who else ""
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        if tag:
+                            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                            ty = max(th + 10, y1)
+                            cv2.rectangle(frame, (x1 - 1, ty - th - 10), (x1 + tw + 10, ty), color, -1)
+                            cv2.putText(frame, tag, (x1 + 5, ty - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                        (0, 0, 0), 2, cv2.LINE_AA)
+                        # prompts under the face: gesture challenge / password progress
+                        prompt, pcol = None, (0, 215, 255)
+                        if known_person and trk_state.challenge and not trk_state.gesture_ok:
+                            from avis.hands import GESTURE_TEXT
+                            left = max(0.0, args.challenge_timeout_s - (time.time() - trk_state.ch_t0))
+                            prompt = f"SHOW: {GESTURE_TEXT.get(trk_state.challenge, trk_state.challenge)}  {left:.0f}s"
+                        elif known_person and password and verified_ok(trk_state):
+                            prompt, pcol = (("UNLOCKED", (80, 255, 80)) if trk_state.unlocked
+                                            else (f"PASSWORD {person(trk_state.name)['pw_idx']}/{len(password)}", (255, 200, 0)))
+                        if prompt:
+                            (pw_, ph_), _ = cv2.getTextSize(prompt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                            py = min(H - 6, y2 + ph_ + 12)
+                            cv2.rectangle(frame, (x1 - 1, py - ph_ - 8), (x1 + pw_ + 10, py + 4), (0, 0, 0), -1)
+                            cv2.putText(frame, prompt, (x1 + 5, py - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pcol, 2, cv2.LINE_AA)
+                    else:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(frame, label, (x1, max(10, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
 
                     # CSV row (ALWAYS WORKS)
                     if metrics and trk_state is not None:
@@ -1109,8 +1710,18 @@ def main():
                             pitch=(trk_state.pitch if (args.pose or args.gaze) else None),
                             roll=(trk_state.roll if (args.pose or args.gaze) else None),
                             gaze=(trk_state.gaze if args.gaze else None),
-                            fps=fps
+                            fps=fps,
+                            name=trk_state.name,
                         )
+
+                presence.update(frame_verified)
+                if face_db is not None and frame_idx % 300 == 0:
+                    face_db.save()
+
+                if session_log is not None and cam_id == 0:
+                    session_log.log(ts, frame_idx, frame_ms, fps, len(people), len(detections),
+                                    len(tracks_out), meas_tracks, pred_tracks, frame_names, frame_sims,
+                                    verified=len(frame_verified))
 
                 # cleanup global reid
                 if args.reid and global_reid is not None:
@@ -1128,8 +1739,15 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
                         y += 20
 
-                # footer
-                cv2.putText(
+                if hand_list and any(getattr(t, "challenge", None) or (password and not getattr(t, "unlocked", True))
+                                     for t in trackers[cam_id].tracks.values()):
+                    for hpts, _, hg in hand_list:
+                        for q in hpts[[0, 4, 8, 12, 16, 20]]:
+                            cv2.circle(frame, (int(q[0]), int(q[1])), 4, (0, 215, 255), -1, cv2.LINE_AA)
+
+                # footer (debug stats; hidden in clean/recording mode)
+                if not clean_hud:
+                  cv2.putText(
                     frame,
                     f"tracker={args.tracker} cam={cam_id} fps={fps:.1f} people={len(people)} dets={len(detections)} tracks={len(tracks_out)} MEAS={meas_tracks} PRED={pred_tracks}",
                     (10, 20),
@@ -1140,7 +1758,34 @@ def main():
                     cv2.LINE_AA,
                 )
 
+                if cam_id == 0:
+                    if enroll_name is not None:
+                        msg = f"ENROLLING {enroll_name}: {len(enroll_embs)}/{args.enroll_samples}{enroll_note}"
+                        if len(id_dets) != 1:
+                            msg += "  (need ONE clear face: look at the camera, no cap brim/hand over it)"
+                        cv2.putText(frame, msg, (10, H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+                    elif sface is not None and not args.record and args.debug:
+                        cv2.putText(frame, "E = enroll a face   Q = quit", (10, H - 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+                if args.record and cam_id == 0:
+                    if recorder is None and record_path and frame_idx >= 20:
+                        rec_fps = max(5, min(30, int(round(fps))))
+                        recorder, codec = open_recorder(record_path, rec_fps, (W, H))
+                        if recorder is None:
+                            logging.error("[REC] could not open a video writer; recording disabled.")
+                            record_path = None
+                        else:
+                            logging.info(f"[REC] recording at {rec_fps} fps ({codec}). Press Q to stop and save.")
+                    if recorder is not None:
+                        recorder.write(frame)
+                        # REC badge on the preview only (not burned into the video)
+                        frame = frame.copy()
+                        cv2.circle(frame, (W - 70, 22), 7, (0, 0, 255), -1)
+                        cv2.putText(frame, "REC", (W - 58, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
                 cv2.imshow(f"AVIS Cam {cam_id}", frame)
+                shown_windows.add(f"AVIS Cam {cam_id}")
 
             if metrics:
                 metrics.flush()
@@ -1148,6 +1793,16 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key != 255 and chr(key).lower() == "q":
                 break
+            # closing the window with its X = quit cleanly (so recordings/logs are saved)
+            if any(cv2.getWindowProperty(wn, cv2.WND_PROP_VISIBLE) < 1 for wn in shown_windows):
+                logging.info("Window closed.")
+                break
+            if key != 255 and chr(key).lower() == "e" and sface is not None and enroll_name is None:
+                typed = input("\n[AVIS] Type the name to enroll, then press Enter: ")
+                enroll_name = sanitize_name(typed) or None
+                enroll_embs = []
+                if enroll_name:
+                    logging.info(f"[ID] enrolling '{enroll_name}': look at the camera, turn your head a little.")
 
             if args.log_interval > 0 and (frame_idx % args.log_interval == 0):
                 logging.info(f"Frame {frame_idx} | fps={fps:.1f}")
@@ -1159,6 +1814,25 @@ def main():
             except Exception:
                 pass
         cv2.destroyAllWindows()
+        if recorder is not None:
+            recorder.release()
+            logging.info(f"[REC] saved video -> {record_path}")
+        if face_db is not None:
+            face_db.save()
+            for nm, k in face_db.learned_this_session.items():
+                logging.info(f"[ML] learned {k} new samples of {nm} this session (profile: {len(face_db.people.get(nm, []))})")
+            for nm, st in photo_state.items():
+                if st["n"]:
+                    logging.info(f"[PHOTOS] saved {st['n']} photos of {nm} -> dataset/{nm}/{session_folder}/")
+            if args.auto_train:
+                start_auto_train(face_db, args)
+        if events is not None:
+            events.close()
+        if hand_tracker is not None:
+            hand_tracker.close()
+        if session_log is not None:
+            session_log.close()
+            logging.info(f"[LOG] saved stats -> {session_log.path}  (graph it: python analyze_runs.py)")
         if metrics:
             metrics.close()
         logging.info("Shutting down cleanly.")

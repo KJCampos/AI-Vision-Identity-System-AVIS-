@@ -1,51 +1,53 @@
-# ---- Python ----
+# ----- PYTHON -----
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
-*.so
-*.egg-info/
-dist/
-build/
-pip-wheel-metadata/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-coverage.xml
 
-# ---- Virtual env ----
-.venv/
+# ----- VENV -----
 venv/
-ENV/
 env/
+.venv/
 
-# ---- OS / Editor ----
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-*.swp
+# ----- DATASETS (DO NOT UPLOAD) -----
+dataset/
+datasets/
+faces/
+face_dataset/
+captured_faces/
+*.jpg
+*.png
 
-# ---- Local outputs ----
-runs/
+# ----- VIDEOS -----
+*.mp4
+*.mov
+*.avi
+*.mkv
+videos/
+testvideo.mp4
+
+# ----- MODEL FILES -----
+*.pt
+*.onnx
+
+# ----- LOGS -----
 logs/
 *.log
 
-# ---- Local datasets / face crops (opt-in) ----
-dataset/
-datasets/
-enrollments/
-snapshots/
-**runs/
+# ----- MISC -----
+.DS_Store
+.idea/
+.vscode/
 
-# ---- Large model files (download on setup) ----
-models/arcface/
-models/**/*.onnx
-*.onnx
-*.pt
-*.pth
-
-# If you DO want to keep YuNet in the repo, uncomment these two lines and remove the onnx rules above
-# !models/yunet/face_detection_yunet_2023mar.onnx
-# !models/emotion/emotion-ferplus-8.onnx
+# ----- PRIVATE DATA (faces, identities, metrics) - never upload -----
+faces_db/
+*.npy
+*.npz
+*.pkl
+runs/
+*.csv
+.venv/
+recordings/
+.venv-hands/
+*.task
+eval/

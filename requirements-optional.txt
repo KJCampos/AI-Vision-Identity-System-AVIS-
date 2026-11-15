@@ -1,0 +1,3 @@
+# Only needed for optional features:
+deep_sort_realtime==1.3.2  # --tracker deepsort
+# mediapipe                # --pose / --gaze (needs NumPy < 2, install separately in its own venv)
