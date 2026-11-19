@@ -1,215 +1,117 @@
-AVIS (AI Vision Identity System)
+# AVIS — AI Vision Identity System
 
-AVIS is a local, real-time computer vision project I built in Python as a CS student.
-It detects people, finds faces in the upper head region, tracks them over time, and can optionally attach extra signals like emotion, head pose/gaze, and ReID (ArcFace) for multi-camera identity continuity.
+AVIS is a real-time computer-vision system I built in Python. It runs locally on a webcam (or an IP camera / video file), detects people, recognizes enrolled faces by name, verifies they're live with a hand-gesture challenge, and keeps learning each person's face over time with a model trained on the GPU.
 
-The point of this repo isn’t “look I ran YOLO once” — it’s to show system design, real-time behavior, clean CLI tooling, and features you’d actually build in a real pipeline.
+The same project also ships two hand-tracking apps: **Hand 3D** (draw, measure and spin 3D shapes in the air) and **Touchless Control** (run slides, music and volume with gestures).
 
----
-
-## What it does
-
-Pipeline (high level):
-1) YOLOv8 detects people
-2) AVIS crops a head ROI from each person box (top portion)
-3) YuNet detects the face + 5 landmarks in that ROI
-4) A tracker maintains IDs across frames (Kalman or DeepSORT)
-5) Optional modules add:
-   - emotion label (FER+ via ONNXRuntime)
-   - head pose (yaw/pitch/roll) + simple gaze direction
-   - ReID embeddings (ArcFace ONNX) + fusion across cameras
-6) Optional CSV metrics logging for evaluation
+Everything runs on your own machine. No face data leaves the PC, and none of it is in this repo.
 
 ---
 
 ## Features
 
-- Real-time YOLOv8 person detection (Ultralytics)
-- Head ROI cropping (keeps face detection focused + faster)
-- Face detection via YuNet (OpenCV FaceDetectorYN)
-- Tracking
-  - Kalman tracker (fast, stable)
-  - DeepSORT (appearance-based tracking)
-  - Track state output: MEAS (measured) vs PRED (predicted)
-- Expression / Emotion (optional)
-  - FER+ model via ONNXRuntime
-- Head pose + gaze (optional)
-  - yaw/pitch/roll estimate + left/center/right gaze approximation
-- ReID + Fusion (optional)
-  - ArcFace embeddings (ONNX)
-  - multi-camera global ID linking using cosine similarity
-- Privacy mode
-  - pixelate all faces or only unknown faces (when identity logic is enabled)
-- Opt-in face crop collection (for building datasets)
-- Metrics CSV logging
-  - FPS, detections, tracks, etc.
+**Detection and recognition**
+- YOLOv8 person detection on the GPU (CUDA, half precision), with YuNet face detection on a head region of each person
+- Face recognition with SFace embeddings and a quality gate (face size, detector score, both eyes visible) so blurry or side-on faces aren't misjudged
+- A second check from a small identity network trained with PyTorch: AVIS only names someone when both agree, which cuts false matches
+- Unknown faces can be blurred or pixelated automatically
+
+**Spoof protection**
+- **Gesture challenge:** when AVIS recognizes someone, it asks for a random gesture (peace sign, thumbs up, open hand, fist, point). A printed photo or phone screen can't answer, and repeated failures raise an alert with a snapshot
+- **Optional gesture password:** a secret sequence of gestures that unlocks a command of your choice
+- Optional anti-spoofing model (off by default)
+
+**Self-learning**
+- High-confidence, verified sightings are added to that person's face profile
+- Photos are saved into per-session folders (`dataset/<name>/<date time> <run>/`)
+- The identity network retrains automatically on the GPU after each session
+
+**Events, data and tools**
+- Event log with optional phone (ntfy) or Discord alerts and snapshots
+- Optional actions: lock Windows when the owner leaves, run a command when someone is recognized
+- Per-session CSV logs, cleaned and graphed with matplotlib (`analyze_runs.py`)
+- Accuracy report on your own labeled clips: FAR, FRR, EER and spoof error rates, with recommended thresholds (`evaluate.py`)
+- Local web dashboard (127.0.0.1 only, token-protected) for people, events, graphs and settings
+- Recording to readable file names (`recordings/AVIS Trial N.mp4`)
+- Optional extras: emotion, head pose / gaze, ArcFace ReID, DeepSORT tracking
+
+**Hand apps (MediaPipe hand tracking)**
+- **Hand 3D** (`hand3d.py`): point and hold to draw; circles become spheres, squares boxes, triangles pyramids. Pinch to grab, spread thumb and index to resize, swipe to spin with real momentum and friction, fist to delete. Shows each shape's real-world size. Sessions record to `recordings/Hand3D/`
+- **Touchless Control** (`control.py`): swipe for next/previous slide, pinch-hold to play/pause, "L" hand up/down for volume, thumbs up to mute, hold a fist to pause gesture control
 
 ---
 
-## Ethics / Privacy
+## Project layout
 
-This is built for ethical, opt-in use only.
-- No covert surveillance
-- No scraping real people
-- Any collection / identity-related features are meant for consenting users
-- Includes anonymization modes to support privacy-first demos
+```
+realtime_yolo.py      main AVIS app (live camera, recognition, verification, recording)
+avis/                 camera sources, face pipeline, learning, hands, events, actions, config
+config.yaml           all settings (command-line flags override it)
+dashboard.py          local web dashboard
+train_identity.py     GPU training for the identity network
+evaluate.py           accuracy report on labeled clips
+record_clip.py        record labeled test clips into eval/
+analyze_runs.py       clean session CSVs and draw graphs
+hand3d.py             Hand 3D app
+control.py            Touchless Control app
+setup_and_run.bat     one-click setup + launch (Windows)
+tools_*.bat           GPU diagnostics, CUDA PyTorch install
+```
 
 ---
 
-## Requirements
+## Setup (Windows)
 
-- macOS or Windows 11+
-- Python 3.12.x
-- Webcam (optional)
+Requirements: Windows 10/11, Python 3.11+, a webcam. An NVIDIA GPU is optional but recommended.
+
+1. Clone the repo and open the folder.
+2. Run **`setup_and_run.bat`**. It creates a `.venv`, installs `requirements.txt` and starts AVIS. To only install, run `setup_and_run.bat --setup-only`.
+3. For GPU speed, run **`tools_install_cuda.bat`** to install the CUDA build of PyTorch, then **`tools_diag.bat`** to confirm the GPU is detected.
+
+Model files (YOLOv8n, YuNet, SFace, MediaPipe hand landmarker) are downloaded or placed under `models/`. Large and personal model files are git-ignored.
+
+> If pip hangs on a dead package index, your global pip config is the cause. The batch files already work around it by ignoring that config.
 
 ---
 
-## Setup
+## Usage
 
-1) Create venv + install deps
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -U pip
-python3 -m pip install -r requirements.txt
-Heads up: OpenCV 4.12+ on Python 3.12 expects NumPy 2.x.
-If you previously installed MediaPipe, it may conflict (MediaPipe wants NumPy < 2). If needed:
+Activate the environment first: `.venv\Scripts\activate`
 
-bash
-Copy code
-python3 -m pip uninstall -y mediapipe
-Models
-YuNet (face detector)
-Expected at:
-models/yunet/face_detection_yunet_2023mar.onnx
+| What | Command |
+|---|---|
+| Live camera | `python realtime_yolo.py` |
+| Enroll a person (with their consent) | `python realtime_yolo.py --enroll "Name"` |
+| Live camera + record | `python realtime_yolo.py --record` |
+| Use an IP camera or file | `python realtime_yolo.py --source rtsp://...` |
+| Graph the last session | `python analyze_runs.py` |
+| Dashboard | `python dashboard.py` |
+| Record a labeled test clip | `python record_clip.py <Name\|unknown\|spoof>` |
+| Accuracy report | `python evaluate.py` (add `--apply` to save recommended thresholds) |
+| Train identity network | `python train_identity.py` |
+| Hand 3D | `python hand3d.py` |
+| Touchless Control | `python control.py` |
 
-ArcFace (ReID / Fusion)
-Download it:
+Only one app can use the webcam at a time.
 
-bash
-Copy code
-mkdir -p models/arcface
-curl -L -o models/arcface/arcface.onnx \
-  "https://huggingface.co/FoivosPar/Arc2Face/resolve/main/arcface.onnx"
-Emotion model (FER+)
-Expected at:
-models/emotion/emotion-ferplus-8.onnx
+**Settings:** edit `config.yaml` or use the dashboard. Useful ones:
+- `spoof_protection.verify`: `gesture` (default), `model` or `none`
+- `spoof_protection.gesture_password`: e.g. `"peace,fist,thumbs_up"`
+- `privacy.anonymize`: blur unknown faces
+- `events.ntfy_topic` / `events.discord_webhook`: alerts (leave empty to stay offline)
+- `actions.auto_lock`: lock Windows when the owner leaves
 
-If your file is actually HTML by mistake, re-download it. ONNX files should not show as “HTML document” in file output.
+---
 
-Quick usage
-Basic (single camera)
+## Privacy
 
-bash
-Copy code
-python3 realtime_yolo.py --camera 0 --no-collect
-Video file
+- Recognition runs entirely on the local machine. AVIS does not look anyone up online; people it doesn't know stay "Unknown".
+- Only enroll people who agree to it. The dashboard's **Forget** button deletes a person's face data.
+- Face profiles (`faces_db/`), photos (`dataset/`), test clips (`eval/`), recordings, logs and trained models are excluded by `.gitignore` and never committed.
+- The dashboard only listens on 127.0.0.1 and needs a per-session token to change anything.
 
-bash
-Copy code
-python3 realtime_yolo.py --video testvideo.mp4 --no-collect
-Lower CPU (run face detector less often)
+---
 
-bash
-Copy code
-python3 realtime_yolo.py --camera 0 --no-collect --detect-every 2
-Main demo commands (with CSV output)
-Kalman tracking (fast baseline)
+## Tech stack
 
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 \
-  --tracker kalman \
-  --conf 0.25 \
-  --detect-every 1 \
-  --no-collect \
-  --eval-csv runs/metrics_kalman.csv
-DeepSORT tracking
-
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 \
-  --tracker deepsort \
-  --conf 0.25 \
-  --detect-every 1 \
-  --no-collect \
-  --eval-csv runs/metrics_deepsort.csv
-Emotion / expression (FER+)
-
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 \
-  --tracker kalman \
-  --conf 0.25 \
-  --detect-every 1 \
-  --expression \
-  --emotion-model models/emotion/emotion-ferplus-8.onnx \
-  --emotion-every 2 \
-  --no-collect \
-  --eval-csv runs/metrics_emotion.csv
-Pose + gaze
-
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 \
-  --tracker kalman \
-  --conf 0.25 \
-  --detect-every 1 \
-  --pose --gaze \
-  --pose-every 2 \
-  --no-collect \
-  --eval-csv runs/metrics_pose_gaze.csv
-ReID (ArcFace embeddings)
-
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 \
-  --tracker kalman \
-  --conf 0.25 \
-  --detect-every 2 \
-  --reid --arcface-model models/arcface/arcface.onnx \
-  --reid-every 4 \
-  --no-collect \
-  --eval-csv runs/metrics_reid.csv
-Fusion (multi-cam global IDs)
-Note: macOS may only expose one webcam index by default. If camera 1 fails, run single-cam.
-
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 --camera 1 \
-  --tracker deepsort \
-  --conf 0.25 \
-  --detect-every 2 \
-  --reid --arcface-model models/arcface/arcface.onnx \
-  --fusion --reid-thresh 0.45 \
-  --reid-every 4 \
-  --no-collect \
-  --eval-csv runs/metrics_fusion.csv
-All combined (DeepSORT + ReID + Fusion + Emotion + Pose/Gaze)
-
-bash
-Copy code
-python3 realtime_yolo.py \
-  --camera 0 \
-  --tracker deepsort \
-  --conf 0.25 \
-  --detect-every 1 \
-  --pose --gaze --pose-every 2 \
-  --expression --emotion-model models/emotion/emotion-ferplus-8.onnx --emotion-every 2 \
-  --reid --arcface-model models/arcface/arcface.onnx --reid-every 4 \
-  --fusion --reid-thresh 0.45 \
-  --no-collect \
-  --eval-csv runs/metrics_all.csv
-Project layout
-realtime_yolo.py
-collect_faces.py
-collect_faces_from_video.py
-models/
-dataset/ (local opt-in data)
-runs/ (metrics CSVs, snapshots, etc.)
+Python · OpenCV (YuNet, SFace) · Ultralytics YOLOv8 · PyTorch (CUDA) · ONNX Runtime · MediaPipe · NumPy · matplotlib · PyYAML

@@ -20,7 +20,7 @@ Gestures
 Keys: T drawing on/off   C clear all   R stop/start recording   S screenshot   M mirror   D hand skeleton   Q quit
 
 Every session is recorded automatically to recordings/Hand3D/Hand3D Session N.mp4 (separate from AVIS Trials).
-The video shows the shapes, orb and labels but not the on-screen help text. Quit with Q (or the window's X) to save.
+The video shows the shapes and labels but not the on-screen help text. Quit with Q (or the window's X) to save.
 
 Sizes are estimated from your hand (average palm = 8 cm across). Calibrate with --palm-cm.
 Runs in AVIS's main environment (.venv), which now includes MediaPipe.
